@@ -434,3 +434,6 @@ initializeApp()
         });
     })
     .catch(error => {
+        logger.error('Server failed to start:', error);
+        process.exit(1);
+    });
