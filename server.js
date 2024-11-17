@@ -6,7 +6,7 @@ const admin = require('firebase-admin');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Price IDs configuration
-const priceIds = {
+const PRICE_IDS = {
     monthly: 'price_1QMDn1CcFkjlkIFGklYtjFft',
     annual: 'price_1QMDprCcFkjlkIFGagJhphnp'
 };
@@ -128,79 +128,309 @@ const initializeApp = async () => {
         });
 
         // Create checkout session
-  // Create checkout session
-app.post('/create-checkout-session', async (req, res) => {
-    try {
-        const { priceId, userId, email } = req.body;
-        
-        // Add debug logging
-        console.log('Received request with:', { priceId, userId, email });
-        console.log('Current PRICE_IDS config:', PRICE_IDS);
+        app.post('/create-checkout-session', async (req, res) => {
+            try {
+                const { priceId, userId, email } = req.body;
+                
+                // Add debug logging
+                console.log('Received request with:', { priceId, userId, email });
+                console.log('Current PRICE_IDS config:', PRICE_IDS);
 
-        if (!priceId || !userId || !email) {
-            console.log('Missing required fields:', { 
-                hasPriceId: !!priceId, 
-                hasUserId: !!userId, 
-                hasEmail: !!email 
-            });
-            return res.status(400).json({
-                error: 'Missing required fields',
-                required: ['priceId', 'userId', 'email']
-            });
-        }
+                if (!priceId || !userId || !email) {
+                    console.log('Missing required fields:', { 
+                        hasPriceId: !!priceId, 
+                        hasUserId: !!userId, 
+                        hasEmail: !!email 
+                    });
+                    return res.status(400).json({
+                        error: 'Missing required fields',
+                        required: ['priceId', 'userId', 'email']
+                    });
+                }
 
-        // Validate priceId
-        const validPriceIds = Object.values(PRICE_IDS);
-        console.log('Validating price ID:', {
-            received: priceId,
-            valid: validPriceIds,
-            isValid: validPriceIds.includes(priceId)
-        });
+                // Validate priceId
+                const validPriceIds = Object.values(PRICE_IDS);
+                console.log('Validating price ID:', {
+                    received: priceId,
+                    valid: validPriceIds,
+                    isValid: validPriceIds.includes(priceId)
+                });
 
-        if (!validPriceIds.includes(priceId)) {
-            return res.status(400).json({
-                error: 'Invalid priceId',
-                validPriceIds
-            });
-        }
+                if (!validPriceIds.includes(priceId)) {
+                    return res.status(400).json({
+                        error: 'Invalid priceId',
+                        validPriceIds
+                    });
+                }
 
-        logger.info('Creating checkout session:', { userId, email });
+                logger.info('Creating checkout session:', { userId, email });
 
-        const session = await stripe.checkout.sessions.create({
-            mode: 'subscription',
-            payment_method_types: ['card'],
-            line_items: [{
-                price: priceId,
-                quantity: 1,
-            }],
-            success_url: `https://cryptosnapshot.net/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: `https://cryptosnapshot.net/canceled-payment?session_id={CHECKOUT_SESSION_ID}`,
-            client_reference_id: userId,
-            customer_email: email,
-            metadata: {
-                userId: userId,
-                firebaseUID: userId
+                const session = await stripe.checkout.sessions.create({
+                    mode: 'subscription',
+                    payment_method_types: ['card'],
+                    line_items: [{
+                        price: priceId,
+                        quantity: 1,
+                    }],
+                    success_url: `https://cryptosnapshot.net/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+                    cancel_url: `https://cryptosnapshot.net/canceled-payment?session_id={CHECKOUT_SESSION_ID}`,
+                    client_reference_id: userId,
+                    customer_email: email,
+                    metadata: {
+                        userId: userId,
+                        firebaseUID: userId
+                    }
+                });
+
+                // Update Firestore
+                await db.collection('users').doc(userId).update({
+                    'subscription.pendingUpgrade': true,
+                    'subscription.checkoutSessionId': session.id,
+                    'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                res.json({ sessionId: session.id });
+
+            } catch (error) {
+                console.error('Detailed checkout error:', {
+                    message: error.message,
+                    type: error.type,
+                    code: error.code
+                });
+                res.status(500).json({
+                    error: error.message,
+                    code: error.code || 'UNKNOWN_ERROR'
+                });
             }
         });
 
-        // Update Firestore
-        await db.collection('users').doc(userId).update({
-            'subscription.pendingUpgrade': true,
-            'subscription.checkoutSessionId': session.id,
-            'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp()
+        // Check subscription status
+        app.post('/check-subscription-status', async (req, res) => {
+            try {
+                const { userId } = req.body;
+
+                if (!userId) {
+                    return res.status(400).json({ error: 'userId is required' });
+                }
+
+                logger.info('Checking subscription status for user:', { userId });
+
+                // Get Firestore data
+                const userDoc = await db.collection('users').doc(userId).get();
+                if (!userDoc.exists) {
+                    return res.status(404).json({ error: 'User not found' });
+                }
+
+                const userData = userDoc.data();
+                logger.debug('User data from Firestore:', userData);
+
+                // Search for Stripe customer
+                const customers = await stripe.customers.search({
+                    query: `metadata['firebaseUID']:'${userId}'`,
+                    limit: 1
+                });
+
+                if (customers.data.length > 0) {
+                    const customer = customers.data[0];
+                    
+                    // Get active subscriptions
+                    const subscriptions = await stripe.subscriptions.list({
+                        customer: customer.id,
+                        status: 'active',
+                        limit: 1
+                    });
+
+                    if (subscriptions.data.length > 0) {
+                        const subscription = subscriptions.data[0];
+
+                        await db.collection('users').doc(userId).update({
+                            'subscription.status': 'active',
+                            'subscription.tier': 'pro',
+                            'subscription.stripeSubscriptionId': subscription.id,
+                            'subscription.currentPeriodEnd': new Date(subscription.current_period_end * 1000),
+                            'subscription.lastChecked': admin.firestore.FieldValue.serverTimestamp()
+                        });
+
+                        return res.json({
+                            active: true,
+                            status: 'active',
+                            currentPeriodEnd: subscription.current_period_end,
+                            subscriptionId: subscription.id
+                        });
+                    }
+                }
+
+                // No active subscription found
+                await db.collection('users').doc(userId).update({
+                    'subscription.status': 'inactive',
+                    'subscription.tier': 'basic',
+                    'subscription.lastChecked': admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                res.json({
+                    active: false,
+                    status: 'inactive',
+                    currentPeriodEnd: null
+                });
+
+            } catch (error) {
+                logger.error('Subscription status check failed:', error);
+                res.status(500).json({
+                    error: error.message,
+                    code: error.code || 'UNKNOWN_ERROR'
+                });
+            }
         });
 
-        res.json({ sessionId: session.id });
+        // Cancel subscription
+        app.post('/cancel-subscription', async (req, res) => {
+            try {
+                const { userId } = req.body;
 
+                if (!userId) {
+                    return res.status(400).json({ error: 'userId is required' });
+                }
+
+                logger.info('Canceling subscription for user:', { userId });
+
+                const customers = await stripe.customers.search({
+                    query: `metadata['firebaseUID']:'${userId}'`,
+                    limit: 1
+                });
+
+                if (customers.data.length === 0) {
+                    return res.status(404).json({ error: 'Customer not found' });
+                }
+
+                const subscriptions = await stripe.subscriptions.list({
+                    customer: customers.data[0].id,
+                    status: 'active',
+                    limit: 1
+                });
+
+                if (subscriptions.data.length === 0) {
+                    return res.status(404).json({ error: 'No active subscription found' });
+                }
+
+                const subscription = await stripe.subscriptions.update(
+                    subscriptions.data[0].id,
+                    { cancel_at_period_end: true }
+                );
+
+                await db.collection('users').doc(userId).update({
+                    'subscription.cancelAtPeriodEnd': true,
+                    'subscription.canceledAt': admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                res.json({
+                    success: true,
+                    subscription: {
+                        id: subscription.id,
+                        currentPeriodEnd: subscription.current_period_end,
+                        cancelAtPeriodEnd: subscription.cancel_at_period_end
+                    }
+                });
+
+            } catch (error) {
+                logger.error('Subscription cancellation failed:', error);
+                res.status(500).json({
+                    error: error.message,
+                    code: error.code || 'UNKNOWN_ERROR'
+                });
+            }
+        });
+
+        // Stripe webhook handler
+        app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+            const sig = req.headers['stripe-signature'];
+            let event;
+
+            try {
+                event = stripe.webhooks.constructEvent(
+                    req.body,
+                    sig,
+                    process.env.STRIPE_WEBHOOK_SECRET
+                );
+            } catch (err) {
+                logger.error('Webhook signature verification failed:', err);
+                return res.status(400).send(`Webhook Error: ${err.message}`);
+            }
+
+            try {
+                switch (event.type) {
+                    case 'customer.subscription.created':
+                    case 'customer.subscription.updated':
+                        const subscription = event.data.object;
+                        const userId = subscription.metadata.firebaseUID;
+                        
+                        if (!userId) {
+                            throw new Error('No Firebase UID found in subscription metadata');
+                        }
+
+                        await db.collection('users').doc(userId).update({
+                            'subscription.status': subscription.status,
+                            'subscription.tier': 'pro',
+                            'subscription.stripeSubscriptionId': subscription.id,
+                            'subscription.currentPeriodEnd': new Date(subscription.current_period_end * 1000),
+                            'subscription.cancelAtPeriodEnd': subscription.cancel_at_period_end,
+                            'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp(),
+                            'subscription.pendingUpgrade': false
+                        });
+                        break;
+
+                    case 'customer.subscription.deleted':
+                        const canceledSubscription = event.data.object;
+                        const canceledUserId = canceledSubscription.metadata.firebaseUID;
+
+                        if (!canceledUserId) {
+                            throw new Error('No Firebase UID found in subscription metadata');
+                        }
+
+                        await db.collection('users').doc(canceledUserId).update({
+                            'subscription.status': 'inactive',
+                            'subscription.tier': 'basic',
+                            'subscription.stripeSubscriptionId': null,
+                            'subscription.currentPeriodEnd': null,
+                            'subscription.cancelAtPeriodEnd': false,
+                            'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp()
+                        });
+                        break;
+
+                    default:
+                        logger.info(`Unhandled event type: ${event.type}`);
+                }
+
+                res.json({ received: true });
+            } catch (error) {
+                logger.error('Webhook processing failed:', error);
+                res.status(500).json({ error: error.message });
+            }
+        });
+
+        // URL configuration check
+        app.get('/check-urls', (req, res) => {
+            res.json({
+                success_url: `https://cryptosnapshot.net/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+                cancel_url: `https://cryptosnapshot.net/canceled-payment?session_id={CHECKOUT_SESSION_ID}`,
+                webhook_url: `${process.env.BASE_URL}/webhook`,
+                stripe_configured: !!process.env.STRIPE_SECRET_KEY,
+                webhook_secret_configured: !!process.env.STRIPE_WEBHOOK_SECRET
+            });
+        });
+
+        return app;
     } catch (error) {
-        console.error('Detailed checkout error:', {
-            message: error.message,
-            type: error.type,
-            code: error.code
-        });
-        res.status(500).json({
-            error: error.message,
-            code: error.code || 'UNKNOWN_ERROR'
-        });
+        logger.error('App initialization failed:', error);
+        throw error;
     }
-});
+};
+
+// Start server with async initialization
+initializeApp()
+    .then(app => {
+        const PORT = process.env.PORT || 3000;
+        app.listen(PORT, () => {
+            logger.info(`Server running on port ${PORT}`);
+        });
+    })
+    .catch(error => {
