@@ -6,9 +6,9 @@ const admin = require('firebase-admin');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Price IDs configuration
-const PRICE_IDS = {
-    monthly: 'price_1QII9UCcFkjlkIFGhm2pxExa',
-    annual: 'price_1QIICICcFkjlkIFG7HT1Fp15'
+const priceIds = {
+    monthly: 'price_1QMDn1CcFkjlkIFGklYtjFft',
+    annual: 'price_1QMDprCcFkjlkIFGagJhphnp'
 };
 
 // Enhanced logging utility
