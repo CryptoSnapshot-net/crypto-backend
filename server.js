@@ -5,7 +5,7 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-// Enhanced logging utility
+// Logger setup
 const logger = {
     info: (msg, data) => console.log(`[INFO] ${msg}`, data || ''),
     error: (msg, err) => console.error(`[ERROR] ${msg}`, {
@@ -13,31 +13,11 @@ const logger = {
         stack: err.stack,
         type: err.type,
         raw: err.raw || ''
-    }),
-    debug: (msg, data) => console.log(`[DEBUG] ${msg}`, data || '')
+    })
 };
 
-// Initialize Express app
-const app = express();
-
-// Configure CORS
-app.use(cors({
-    origin: ['https://cryptosnapshot.net', 'http://localhost:3000'],
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
-}));
-
-// Regular JSON parsing for normal routes
-app.use((req, res, next) => {
-    if (req.path === '/webhook') {
-        next();
-    } else {
-        express.json()(req, res, next);
-    }
-});
-
-// Replace your current Firebase initialization code with this:
+// Initialize Firebase Admin globally
+let db = null;
 const initializeFirebase = () => {
     if (!admin.apps.length) {
         try {
@@ -56,20 +36,38 @@ const initializeFirebase = () => {
                 credential: admin.credential.cert(credentials)
             });
             
-            console.log('Firebase Admin initialized successfully');
+            db = admin.firestore();
+            logger.info('Firebase Admin initialized successfully');
         } catch (error) {
-            console.error('Firebase initialization error:', error);
+            logger.error('Firebase initialization error:', error);
             throw error;
         }
     }
-    return admin.firestore();
+    return db;
 };
 
-// Price IDs configuration
-const PRICE_IDS = {
-    monthly: 'price_1QII9UCcFkjlkIFGhm2pxExa',
-    annual: 'price_1QIICICcFkjlkIFG7HT1Fp15'
-};
+// Initialize Express app
+const app = express();
+
+// Configure CORS
+app.use(cors({
+    origin: ['https://cryptosnapshot.net', 'http://localhost:3000'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Initialize Firebase and get db reference
+db = initializeFirebase();
+
+// Regular JSON parsing for normal routes
+app.use((req, res, next) => {
+    if (req.path === '/webhook') {
+        next();
+    } else {
+        express.json()(req, res, next);
+    }
+});
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -77,19 +75,92 @@ app.get('/health', (req, res) => {
         status: 'healthy',
         timestamp: new Date().toISOString(),
         stripe: !!process.env.STRIPE_SECRET_KEY,
-        firebase: admin.apps.length > 0
+        firebase: !!db,
+        firebaseInitialized: admin.apps.length > 0
     });
 });
 
-// Test Stripe connection
-app.get('/test-stripe', async (req, res) => {
+// Check subscription status
+app.post('/check-subscription-status', async (req, res) => {
     try {
-        const test = await stripe.customers.list({ limit: 1 });
-        logger.info('Stripe connection test successful');
-        res.json({ success: true, message: 'Stripe connection successful' });
+        const { userId } = req.body;
+
+        if (!userId) {
+            return res.status(400).json({ error: 'userId is required' });
+        }
+
+        logger.info('Checking subscription status for user:', { userId });
+
+        if (!db) {
+            logger.error('Database not initialized');
+            return res.status(500).json({ error: 'Database connection error' });
+        }
+
+        // Get Firestore data
+        const userDoc = await db.collection('users').doc(userId).get();
+        if (!userDoc.exists) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const userData = userDoc.data();
+        logger.info('User data from Firestore:', userData);
+
+        // Search for Stripe customer
+        const customers = await stripe.customers.search({
+            query: `metadata['firebaseUID']:'${userId}'`,
+            limit: 1
+        });
+
+        if (customers.data.length > 0) {
+            const customer = customers.data[0];
+            
+            // Get active subscriptions
+            const subscriptions = await stripe.subscriptions.list({
+                customer: customer.id,
+                status: 'active',
+                limit: 1
+            });
+
+            if (subscriptions.data.length > 0) {
+                const subscription = subscriptions.data[0];
+
+                // Update Firestore with current status
+                await db.collection('users').doc(userId).update({
+                    'subscription.status': 'active',
+                    'subscription.tier': 'pro',
+                    'subscription.stripeSubscriptionId': subscription.id,
+                    'subscription.currentPeriodEnd': new Date(subscription.current_period_end * 1000),
+                    'subscription.lastChecked': admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                return res.json({
+                    active: true,
+                    status: 'active',
+                    currentPeriodEnd: subscription.current_period_end,
+                    subscriptionId: subscription.id
+                });
+            }
+        }
+
+        // No active subscription found
+        await db.collection('users').doc(userId).update({
+            'subscription.status': 'inactive',
+            'subscription.tier': 'basic',
+            'subscription.lastChecked': admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        res.json({
+            active: false,
+            status: 'inactive',
+            currentPeriodEnd: null
+        });
+
     } catch (error) {
-        logger.error('Stripe connection test failed:', error);
-        res.status(500).json({ error: error.message });
+        logger.error('Subscription status check failed:', error);
+        res.status(500).json({
+            error: error.message,
+            code: error.code || 'UNKNOWN_ERROR'
+        });
     }
 });
 
@@ -105,13 +176,9 @@ app.post('/create-checkout-session', async (req, res) => {
             });
         }
 
-        // Validate priceId against known price IDs
-        const validPriceIds = Object.values(PRICE_IDS);
-        if (!validPriceIds.includes(priceId)) {
-            return res.status(400).json({
-                error: 'Invalid priceId',
-                validPriceIds
-            });
+        if (!db) {
+            logger.error('Database not initialized');
+            return res.status(500).json({ error: 'Database connection error' });
         }
 
         logger.info('Creating checkout session:', { userId, email });
@@ -151,229 +218,10 @@ app.post('/create-checkout-session', async (req, res) => {
     }
 });
 
-// Check subscription status
-app.post('/check-subscription-status', async (req, res) => {
-    try {
-        const { userId } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({ error: 'userId is required' });
-        }
-
-        logger.info('Checking subscription status for user:', { userId });
-
-        // Get Firestore data
-        const userDoc = await db.collection('users').doc(userId).get();
-        if (!userDoc.exists) {
-            return res.status(404).json({ error: 'User not found' });
-        }
-
-        const userData = userDoc.data();
-        logger.debug('User data from Firestore:', userData);
-
-        // Search for Stripe customer
-        const customers = await stripe.customers.search({
-            query: `metadata['firebaseUID']:'${userId}'`,
-            limit: 1
-        });
-
-        if (customers.data.length > 0) {
-            const customer = customers.data[0];
-            
-            // Get active subscriptions
-            const subscriptions = await stripe.subscriptions.list({
-                customer: customer.id,
-                status: 'active',
-                limit: 1
-            });
-
-            if (subscriptions.data.length > 0) {
-                const subscription = subscriptions.data[0];
-
-                // Update Firestore with current status
-                await db.collection('users').doc(userId).update({
-                    'subscription.status': 'active',
-                    'subscription.tier': 'pro',
-                    'subscription.stripeSubscriptionId': subscription.id,
-                    'subscription.currentPeriodEnd': admin.firestore.FieldValue.serverTimestamp(),
-                    'subscription.lastChecked': admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                return res.json({
-                    active: true,
-                    status: 'active',
-                    currentPeriodEnd: subscription.current_period_end,
-                    subscriptionId: subscription.id
-                });
-            }
-        }
-
-        // No active subscription found
-        await db.collection('users').doc(userId).update({
-            'subscription.status': 'inactive',
-            'subscription.tier': 'basic',
-            'subscription.lastChecked': admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        res.json({
-            active: false,
-            status: 'inactive',
-            currentPeriodEnd: null
-        });
-
-    } catch (error) {
-        logger.error('Subscription status check failed:', error);
-        res.status(500).json({
-            error: error.message,
-            code: error.code || 'UNKNOWN_ERROR'
-        });
-    }
-});
-
-// Cancel subscription
-app.post('/cancel-subscription', async (req, res) => {
-    try {
-        const { userId } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({ error: 'userId is required' });
-        }
-
-        logger.info('Canceling subscription for user:', { userId });
-
-        const customers = await stripe.customers.search({
-            query: `metadata['firebaseUID']:'${userId}'`,
-            limit: 1
-        });
-
-        if (customers.data.length === 0) {
-            return res.status(404).json({ error: 'Customer not found' });
-        }
-
-        const subscriptions = await stripe.subscriptions.list({
-            customer: customers.data[0].id,
-            status: 'active',
-            limit: 1
-        });
-
-        if (subscriptions.data.length === 0) {
-            return res.status(404).json({ error: 'No active subscription found' });
-        }
-
-        // Cancel at period end
-        const subscription = await stripe.subscriptions.update(
-            subscriptions.data[0].id,
-            { cancel_at_period_end: true }
-        );
-
-        // Update Firestore
-        await db.collection('users').doc(userId).update({
-            'subscription.cancelAtPeriodEnd': true,
-            'subscription.canceledAt': admin.firestore.FieldValue.serverTimestamp()
-        });
-
-        res.json({
-            success: true,
-            subscription: {
-                id: subscription.id,
-                currentPeriodEnd: subscription.current_period_end,
-                cancelAtPeriodEnd: subscription.cancel_at_period_end
-            }
-        });
-
-    } catch (error) {
-        logger.error('Subscription cancellation failed:', error);
-        res.status(500).json({
-            error: error.message,
-            code: error.code || 'UNKNOWN_ERROR'
-        });
-    }
-});
-
-// Stripe webhook handler
-app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    let event;
-
-    try {
-        event = stripe.webhooks.constructEvent(
-            req.body,
-            sig,
-            process.env.STRIPE_WEBHOOK_SECRET
-        );
-    } catch (err) {
-        logger.error('Webhook signature verification failed:', err);
-        return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    try {
-        // Handle the event
-        switch (event.type) {
-            case 'customer.subscription.created':
-            case 'customer.subscription.updated':
-                const subscription = event.data.object;
-                const userId = subscription.metadata.firebaseUID;
-                
-                if (!userId) {
-                    throw new Error('No Firebase UID found in subscription metadata');
-                }
-
-                await db.collection('users').doc(userId).update({
-                    'subscription.status': subscription.status,
-                    'subscription.tier': 'pro',
-                    'subscription.stripeSubscriptionId': subscription.id,
-                    'subscription.currentPeriodEnd': new Date(subscription.current_period_end * 1000),
-                    'subscription.cancelAtPeriodEnd': subscription.cancel_at_period_end,
-                    'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp(),
-                    'subscription.pendingUpgrade': false
-                });
-                break;
-
-            case 'customer.subscription.deleted':
-                const canceledSubscription = event.data.object;
-                const canceledUserId = canceledSubscription.metadata.firebaseUID;
-
-                if (!canceledUserId) {
-                    throw new Error('No Firebase UID found in subscription metadata');
-                }
-
-                await db.collection('users').doc(canceledUserId).update({
-                    'subscription.status': 'inactive',
-                    'subscription.tier': 'basic',
-                    'subscription.stripeSubscriptionId': null,
-                    'subscription.currentPeriodEnd': null,
-                    'subscription.cancelAtPeriodEnd': false,
-                    'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp()
-                });
-                break;
-
-            default:
-                logger.info(`Unhandled event type: ${event.type}`);
-        }
-
-        res.json({ received: true });
-    } catch (error) {
-        logger.error('Webhook processing failed:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// URL configuration check
-app.get('/check-urls', (req, res) => {
-    res.json({
-        success_url: `https://cryptosnapshot.net/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `https://cryptosnapshot.net/canceled-payment?session_id={CHECKOUT_SESSION_ID}`,
-        webhook_url: `${process.env.BASE_URL}/webhook`,
-        stripe_configured: !!process.env.STRIPE_SECRET_KEY,
-        webhook_secret_configured: !!process.env.STRIPE_WEBHOOK_SECRET
-    });
-});
-
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     logger.info(`Server running on port ${PORT}`);
 });
 
-// Export for testing
 module.exports = app;
