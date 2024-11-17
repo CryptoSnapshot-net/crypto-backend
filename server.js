@@ -37,24 +37,33 @@ app.use((req, res, next) => {
     }
 });
 
-// Initialize Firebase Admin
+// Replace your current Firebase initialization code with this:
 const initializeFirebase = () => {
     if (!admin.apps.length) {
         try {
-            const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+            const credentials = {
+                type: "service_account",
+                project_id: process.env.FIREBASE_PROJECT_ID,
+                private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+                client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                token_uri: "https://oauth2.googleapis.com/token",
+                auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+            };
+
             admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount)
+                credential: admin.credential.cert(credentials)
             });
-            logger.info('Firebase Admin initialized successfully');
+            
+            console.log('Firebase Admin initialized successfully');
         } catch (error) {
-            logger.error('Firebase initialization failed:', error);
+            console.error('Firebase initialization error:', error);
             throw error;
         }
     }
     return admin.firestore();
 };
-
-const db = initializeFirebase();
 
 // Price IDs configuration
 const PRICE_IDS = {
