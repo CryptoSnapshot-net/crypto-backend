@@ -16,7 +16,7 @@ console.log('STRIPE_SECRET_KEY prefix:', process.env.STRIPE_SECRET_KEY?.substrin
 const app = express();
 
 app.use(cors({
-    origin: ['https://cryptosnapshot.net', 'http://localhost:3000'],
+    origin: ['https://cryptosnapshot.net'],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
