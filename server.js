@@ -281,43 +281,57 @@ const initializeApp = async () => {
                 });
             }
         });
-
-        // Cancel subscription
+        
+// Cancel subscription
 app.post('/cancel-subscription', async (req, res) => {
     try {
-        const { userId } = req.body;
+        const { email, userId } = req.body;
         
         // Add debug logging
         console.log('Received cancellation request:', {
+            hasEmail: !!email,
             hasUserId: !!userId,
+            email: email,
             userId: userId,
             body: req.body
         });
 
-        if (!userId) {
-            console.log('Missing userId in request');
-            return res.status(400).json({ error: 'userId is required' });
+        if (!email) {
+            console.log('Missing email in request');
+            return res.status(400).json({ error: 'Email is required' });
         }
 
-        logger.info('Looking up customer for user:', { userId });
-
-        const customers = await stripe.customers.search({
-            query: `metadata['firebaseUID']:'${userId}'`,
+        // First try to find customer by email
+        logger.info('Looking up customer by email:', { email });
+        const customers = await stripe.customers.list({
+            email: email.toLowerCase(),
             limit: 1
         });
 
+        // If no customer found by email, try Firebase UID
+        let customer = customers.data[0];
+        if (!customer && userId) {
+            logger.info('No customer found by email, trying Firebase UID:', { userId });
+            const customersByUID = await stripe.customers.search({
+                query: `metadata['firebaseUID']:'${userId}'`,
+                limit: 1
+            });
+            customer = customersByUID.data[0];
+        }
+
         console.log('Customer search results:', {
-            customersFound: customers.data.length,
-            firstCustomerId: customers.data[0]?.id
+            customerFound: !!customer,
+            customerId: customer?.id
         });
 
-        if (customers.data.length === 0) {
-            console.log('No customer found for userId:', userId);
+        if (!customer) {
+            console.log('No customer found for:', { email, userId });
             return res.status(404).json({ error: 'Customer not found' });
         }
 
+        // Find active subscription
         const subscriptions = await stripe.subscriptions.list({
-            customer: customers.data[0].id,
+            customer: customer.id,
             status: 'active',
             limit: 1
         });
@@ -328,25 +342,30 @@ app.post('/cancel-subscription', async (req, res) => {
         });
 
         if (subscriptions.data.length === 0) {
-            console.log('No active subscription found for customer:', customers.data[0].id);
+            console.log('No active subscription found for customer:', customer.id);
             return res.status(404).json({ error: 'No active subscription found' });
         }
 
-        // Actually cancel the subscription
+        // Cancel the subscription
         const subscription = await stripe.subscriptions.update(
             subscriptions.data[0].id,
             { cancel_at_period_end: true }
         );
 
-        // Update Firestore
-        await db.collection('users').doc(userId).update({
-            'subscription.cancelAtPeriodEnd': true,
-            'subscription.canceledAt': admin.firestore.FieldValue.serverTimestamp()
-        });
+        // Update Firestore if userId provided
+        if (userId) {
+            await db.collection('users').doc(userId).update({
+                'subscription.status': 'cancelled',
+                'subscription.cancelAtPeriodEnd': true,
+                'subscription.canceledAt': admin.firestore.FieldValue.serverTimestamp(),
+                'subscription.endDate': new Date(subscription.current_period_end * 1000)
+            });
+        }
 
         console.log('Subscription cancelled successfully:', {
             subscriptionId: subscription.id,
-            userId: userId
+            customer: customer.id,
+            email: email
         });
 
         res.json({
@@ -371,6 +390,10 @@ app.post('/cancel-subscription', async (req, res) => {
         });
     }
 });
+
+
+
+        
         // Stripe webhook handler
         app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
             const sig = req.headers['stripe-signature'];
