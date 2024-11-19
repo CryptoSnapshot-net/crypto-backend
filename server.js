@@ -7,8 +7,8 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Price IDs configuration
 const PRICE_IDS = {
-    monthly: 'price_1QMDn1CcFkjlkIFGklYtjFft',
-    annual: 'price_1QMDprCcFkjlkIFGagJhphnp'
+    monthly: 'price_1QMtsECcFkjlkIFGAmSwTHbX',
+    annual: 'price_1QMttrCcFkjlkIFGQ3sSV7I0'
 };
 
 // Enhanced logging utility
