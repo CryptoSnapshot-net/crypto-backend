@@ -395,89 +395,114 @@ app.post('/cancel-subscription', async (req, res) => {
 
         
         // Stripe webhook handler
-        app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
-            const sig = req.headers['stripe-signature'];
-            let event;
+app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
 
-            try {
-                event = stripe.webhooks.constructEvent(
-                    req.body,
-                    sig,
-                    process.env.STRIPE_WEBHOOK_SECRET
-                );
-            } catch (err) {
-                logger.error('Webhook signature verification failed:', err);
-                return res.status(400).send(`Webhook Error: ${err.message}`);
+    try {
+        logger.info('Received webhook event');
+        
+        event = stripe.webhooks.constructEvent(
+            req.body,
+            sig,
+            process.env.STRIPE_WEBHOOK_SECRET
+        );
+        
+        logger.info('Webhook event type:', event.type);
+
+        try {
+            switch (event.type) {
+                case 'customer.subscription.created':
+                case 'customer.subscription.updated':
+                    const subscription = event.data.object;
+                    const userId = subscription.metadata.firebaseUID;
+                    
+                    logger.info('Processing subscription event:', {
+                        subscriptionId: subscription.id,
+                        userId: userId,
+                        status: subscription.status
+                    });
+
+                    if (!userId) {
+                        throw new Error('No Firebase UID found in subscription metadata');
+                    }
+
+                    await db.collection('users').doc(userId).update({
+                        'subscription.status': subscription.status,
+                        'subscription.tier': 'pro',
+                        'subscription.stripeSubscriptionId': subscription.id,
+                        'subscription.currentPeriodEnd': new Date(subscription.current_period_end * 1000),
+                        'subscription.cancelAtPeriodEnd': subscription.cancel_at_period_end,
+                        'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp(),
+                        'subscription.pendingUpgrade': false
+                    });
+                    
+                    logger.info('Successfully updated user subscription in Firebase');
+                    break;
+
+                case 'customer.subscription.deleted':
+                    const canceledSubscription = event.data.object;
+                    const canceledUserId = canceledSubscription.metadata.firebaseUID;
+
+                    logger.info('Processing subscription deletion:', {
+                        subscriptionId: canceledSubscription.id,
+                        userId: canceledUserId
+                    });
+
+                    if (!canceledUserId) {
+                        throw new Error('No Firebase UID found in subscription metadata');
+                    }
+
+                    await db.collection('users').doc(canceledUserId).update({
+                        'subscription.status': 'inactive',
+                        'subscription.tier': 'basic',
+                        'subscription.stripeSubscriptionId': null,
+                        'subscription.currentPeriodEnd': null,
+                        'subscription.cancelAtPeriodEnd': false,
+                        'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp()
+                    });
+                    
+                    logger.info('Successfully updated canceled subscription in Firebase');
+                    break;
+
+                default:
+                    logger.info(`Unhandled event type: ${event.type}`);
             }
 
-            try {
-                switch (event.type) {
-                    case 'customer.subscription.created':
-                    case 'customer.subscription.updated':
-                        const subscription = event.data.object;
-                        const userId = subscription.metadata.firebaseUID;
-                        
-                        if (!userId) {
-                            throw new Error('No Firebase UID found in subscription metadata');
-                        }
-
-                        await db.collection('users').doc(userId).update({
-                            'subscription.status': subscription.status,
-                            'subscription.tier': 'pro',
-                            'subscription.stripeSubscriptionId': subscription.id,
-                            'subscription.currentPeriodEnd': new Date(subscription.current_period_end * 1000),
-                            'subscription.cancelAtPeriodEnd': subscription.cancel_at_period_end,
-                            'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp(),
-                            'subscription.pendingUpgrade': false
-                        });
-                        break;
-
-                    case 'customer.subscription.deleted':
-                        const canceledSubscription = event.data.object;
-                        const canceledUserId = canceledSubscription.metadata.firebaseUID;
-
-                        if (!canceledUserId) {
-                            throw new Error('No Firebase UID found in subscription metadata');
-                        }
-
-                        await db.collection('users').doc(canceledUserId).update({
-                            'subscription.status': 'inactive',
-                            'subscription.tier': 'basic',
-                            'subscription.stripeSubscriptionId': null,
-                            'subscription.currentPeriodEnd': null,
-                            'subscription.cancelAtPeriodEnd': false,
-                            'subscription.lastUpdated': admin.firestore.FieldValue.serverTimestamp()
-                        });
-                        break;
-
-                    default:
-                        logger.info(`Unhandled event type: ${event.type}`);
-                }
-
-                res.json({ received: true });
-            } catch (error) {
-                logger.error('Webhook processing failed:', error);
-                res.status(500).json({ error: error.message });
-            }
-        });
-
-        // URL configuration check
-        app.get('/check-urls', (req, res) => {
-            res.json({
-                success_url: `https://cryptosnapshot.net/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-                cancel_url: `https://cryptosnapshot.net/canceled-payment?session_id={CHECKOUT_SESSION_ID}`,
-                webhook_url: `${process.env.BASE_URL}/webhook`,
-                stripe_configured: !!process.env.STRIPE_SECRET_KEY,
-                webhook_secret_configured: !!process.env.STRIPE_WEBHOOK_SECRET
+            res.json({ received: true });
+        } catch (error) {
+            logger.error('Webhook processing failed:', {
+                error: error.message,
+                stack: error.stack,
+                eventType: event.type,
+                subscriptionId: event.data.object.id
             });
-        });
+            // Send 200 even on processing error to prevent retries
+            res.json({ received: true, error: error.message });
+        }
+    } catch (err) {
+        logger.error('Webhook signature verification failed:', err);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+});
 
-        return app;
+// URL configuration check
+app.get('/check-urls', (req, res) => {
+    res.json({
+        success_url: `https://cryptosnapshot.net/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `https://cryptosnapshot.net/canceled-payment?session_id={CHECKOUT_SESSION_ID}`,
+        webhook_url: `${process.env.BASE_URL}/webhook`,
+        stripe_configured: !!process.env.STRIPE_SECRET_KEY,
+        webhook_secret_configured: !!process.env.STRIPE_WEBHOOK_SECRET
+    });
+});
+
+return app;
     } catch (error) {
         logger.error('App initialization failed:', error);
         throw error;
     }
-};
+};        
 
 // Start server with async initialization
 initializeApp()
@@ -490,4 +515,5 @@ initializeApp()
     .catch(error => {
         logger.error('Server failed to start:', error);
         process.exit(1);
-    });
+    });        
+
