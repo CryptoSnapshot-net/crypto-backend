@@ -165,22 +165,28 @@ const initializeApp = async () => {
 
                 logger.info('Creating checkout session:', { userId, email });
 
-                const session = await stripe.checkout.sessions.create({
-                    mode: 'subscription',
-                    payment_method_types: ['card'],
-                    line_items: [{
-                        price: priceId,
-                        quantity: 1,
-                    }],
-                    success_url: `https://cryptosnapshot.net/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-                    cancel_url: `https://cryptosnapshot.net/canceled-payment?session_id={CHECKOUT_SESSION_ID}`,
-                    client_reference_id: userId,
-                    customer_email: email,
-                    metadata: {
-                        userId: userId,
-                        firebaseUID: userId
-                    }
-                });
+    const session = await stripe.checkout.sessions.create({
+    mode: 'subscription',
+    payment_method_types: ['card'],
+    line_items: [{
+        price: priceId,
+        quantity: 1,
+    }],
+    success_url: `https://cryptosnapshot.net/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `https://cryptosnapshot.net/canceled-payment?session_id={CHECKOUT_SESSION_ID}`,
+    client_reference_id: userId,
+    customer_email: email,
+    metadata: {
+        userId: userId,
+        firebaseUID: userId
+    },
+    subscription_data: {      // Add this section
+        metadata: {
+            userId: userId,
+            firebaseUID: userId
+        }
+    }
+});
 
                 // Update Firestore
                 await db.collection('users').doc(userId).update({
