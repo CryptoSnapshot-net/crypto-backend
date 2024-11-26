@@ -412,10 +412,12 @@ app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) =
 
         try {
             switch (event.type) {
-                case 'customer.subscription.created':
-                case 'customer.subscription.updated':
-                    const subscription = event.data.object;
-                    const userId = subscription.metadata.firebaseUID;
+case 'customer.subscription.created':
+case 'customer.subscription.updated':
+    const subscription = event.data.object;
+    const userId = subscription.metadata.userId || subscription.metadata.firebaseUID;
+    
+    logger.info('Subscription metadata:', subscription.metadata);
                     
                     logger.info('Processing subscription event:', {
                         subscriptionId: subscription.id,
