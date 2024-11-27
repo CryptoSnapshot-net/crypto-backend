@@ -421,7 +421,28 @@ app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) =
 case 'customer.subscription.created':
 case 'customer.subscription.updated':
     const subscription = event.data.object;
-    const userId = subscription.metadata.userId || subscription.metadata.firebaseUID;
+    // First try to get userId from the subscription's metadata
+    let userId = subscription.metadata?.userId || subscription.metadata?.firebaseUID;
+    
+    if (!userId) {
+        try {
+            // If no metadata, try to get the original checkout session
+            const sessions = await stripe.checkout.sessions.list({
+                subscription: subscription.id,
+                limit: 1
+            });
+            if (sessions.data.length > 0) {
+                userId = sessions.data[0].client_reference_id;
+            }
+        } catch (error) {
+            logger.error('Error fetching checkout session:', error);
+        }
+    }
+    
+    logger.info('Session data:', {
+        sessionId: subscription.id,
+        clientReferenceId: userId
+    });
     
     logger.info('Subscription metadata:', subscription.metadata);
                     
